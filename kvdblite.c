@@ -17,9 +17,6 @@
 // avl_import(char * fn) and avl_append(char *fn). The import needs to check that root is NULL.
 // Memory protection (for struct avltree), and mutex locking for all operations
 
-// Note: Since some functions use recursion, is there a danger of stack overflow
-// and/or too deep? Tested till 100,000 and worked. Maybe no, as the depth is only 20 for 100,000 entries???
-
 struct node {
   struct node *left, *right;
   int diff;
@@ -38,6 +35,51 @@ static int insert(avl_key_t *key, avl_value_t *value, struct node **rp);
 static int remove_root(struct node **rp);
 static int remove_(avl_key_t *key, struct node **rp);
 static int truncate_transaction_file(struct avltree *avl);
+
+
+//
+// CRC32
+//
+
+// Precomputed table for CRC32 checksums
+uint32_t crc32_table[256];
+
+// Initialize the precomputed table
+void generate_CRC32_table() {
+    uint32_t c;
+    for (int i = 0; i < 256; i++) {
+        c = i;
+        for (int j = 0; j < 8; j++) {
+            if (c & 1) {
+                c = 0xEDB88320L ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+        }
+        crc32_table[i] = c;
+    }
+}
+
+// Compute the CRC32 checksum
+uint32_t calc_CRC32(unsigned char *buf, int len, uint32_t prev_crc) {
+    uint32_t crc = ~prev_crc;
+    while (len--) {
+        crc = crc32_table[(crc ^ *buf++) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+// Wrapper function for calculating the CRC32 for two concatenated memory blocks
+uint32_t key_and_value_CRC32(avl_key_t *k, int klen, avl_value_t *v, int vlen) {
+    uint32_t crc = 0; // Initial CRC value
+    crc = calc_CRC32(k, klen, crc);
+    crc = calc_CRC32(v, vlen, crc);
+    return crc;
+}
+
+//
+// END CRC32
+//
 
 //
 // DISK
@@ -111,6 +153,10 @@ static int fread_uint8_t(uint8_t *value, FILE *file) {
 }
 
 static void save_tree_to_disk(struct node *root, FILE *file) {
+  // First save magic number
+  uint32_t magic = 0x42473000;
+  fwrite_uint32_t(magic, file);
+
   if (root == NULL) {
     fwrite_uint32_t(0, file);
     return;
@@ -124,6 +170,11 @@ static void save_tree_to_disk(struct node *root, FILE *file) {
   l = strlen(root->value);
   fwrite_uint32_t(l, file);
   fwrite_str(root->value, file);
+
+  // Save CRC32 of key and value concatenated
+  fwrite_uint32_t(key_and_value_CRC32(root->key, strlen(root->key), root->value,
+                                      strlen(root->value)),
+                  file);
 
   // Save diff value
   fwrite_uint32_t((uint32_t) root->diff, file);
@@ -156,9 +207,12 @@ int avl_save_database(struct avltree *avl) {
 
 static struct node *load_tree_from_disk(FILE *file) {
   char key[256], value[256];
-  uint32_t l;
+  uint32_t l, crc_calculated, crc_from_file;
   uint8_t *v;
 
+  // Gary you were here
+  // Need to load magic number
+  
   if (fread_uint32_t(&l, file) < 0)
     return NULL;
   if (l == 0)
@@ -179,6 +233,15 @@ static struct node *load_tree_from_disk(FILE *file) {
   fread_str(&v, l, file);
   new_node->value = strdup(v);
   free(v);
+
+  // Read the CRC32 and check
+  if (fread_uint32_t(&crc_from_file, file) < 0)
+    return NULL;
+  crc_calculated = key_and_value_CRC32(new_node->key, strlen(new_node->key), new_node->value, strlen(new_node->value));
+  if (crc_calculated!=crc_from_file) {
+    // CRC error
+    return NULL;
+  }
 
   // Load diff value
   if (fread_uint32_t(&new_node->diff, file) < 0)
@@ -592,6 +655,7 @@ void avl_free(struct avltree *avl) {
 }
 
 struct avltree *avl_make(uint8_t *fn) {
+  generate_CRC32_table();
   struct avltree *avl = malloc(sizeof *avl);
   if (avl == NULL) {
     return NULL;

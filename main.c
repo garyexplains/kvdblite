@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "kvdblite.h"
 
@@ -7,13 +8,13 @@ static unsigned long rand_X = 123456789;
 unsigned long VAX_rng(void) { return (rand_X = 69069 * rand_X + 362437); }
 
 int main() {
-  //struct avltree *avl = avl_make("mykvdb.kvb");
-  struct avltree *avl = avl_make(NULL);
+  struct avltree *avl = avl_make("mykvdb.kvb");
+  //struct avltree *avl = avl_make(NULL);
   printf("size: %d\n", avl_db_size(avl));
   printf("valid: %d\n", avl_check_valid(avl));
 
   if (avl_db_size(avl) == 0) {
-#define TREESIZE 100000
+#define TREESIZE 100
     struct node *result = NULL;
 
     uint8_t bk[64];
@@ -27,9 +28,9 @@ int main() {
         printf("%d\n", i);
     }
 
-    // if (avl_save_database(avl) < 0) {
-    //   printf("Failed to save database to disk\n");
-    // }
+    if (avl_save_database(avl) < 0) {
+       printf("Failed to save database to disk\n");
+    }
 
     // Post save operations that will go in transaction file
     avl_insert(avl, "1", "11111");
@@ -52,8 +53,11 @@ int main() {
     printf("3 exists in DB.. That is good!\n");
   }
 
+    unsigned char data1[] = "This ";
+    unsigned char data2[] = "CRC-32 online tool helps you calculate checksum from string or binary.";
+
   // printf("valid: %d\n", avl_check_valid(avl));
-  //avl_debug_inorder(avl);
+  // avl_debug_inorder(avl);
 
   //   rand_X = 123456789;
   //   for (int i = 0; i < TREESIZE; i++) {
