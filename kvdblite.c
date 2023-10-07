@@ -8,28 +8,17 @@
 
 #define KVDBLITE_OP_INSERT 43
 #define KVDBLITE_OP_REMOVE 45
-#define KVDBLITE_OP_DONE_INSERT 42
-#define KVDBLITE_OP_DONE_REMOVE 47
 
 // TODO
-// 1. Proper API, set name in avl_make, avl_save, etc
-// 2. Duplicate key names, doesn't overwrite them at the moment or create error, have a flag maybe?
-// 3. CRC32 in saved db file
-// 4. avl_import(char * fn) and avl_append(char *fn). The import needs to check that root is NULL.
-// 5. Memory protection (for struct avltree), and mutex locking for all operations
+// Increase performance of adding 100,000 entries. Seems creating journal file is slow.
+// CRC32 in saved db file
+// Only works with strings. Keys should be strings, but value should be binary with a len
+// Error handling needs to be robust and consistent
+// avl_import(char * fn) and avl_append(char *fn). The import needs to check that root is NULL.
+// Memory protection (for struct avltree), and mutex locking for all operations
 
-// Forwards
-
-static int insert(avl_key_t *key, avl_value_t *value, struct node **rp);
-static int remove_root(struct node **rp);
-static int remove_(avl_key_t *key, struct node **rp);
-static int truncate_transaction_file(struct avltree *avl);
-
-#define fail(fmt, ...)                                                         \
-  do {                                                                         \
-    printf(fmt "\n", ##__VA_ARGS__);                                           \
-    exit(1);                                                                   \
-  } while (0)
+// Note: Since some functions use recursion, is there a danger of stack overflow
+// and/or too deep? Tested till 100,000 and worked. Maybe no, as the depth is only 20 for 100,000 entries???
 
 struct node {
   struct node *left, *right;
@@ -43,6 +32,12 @@ struct avltree {
   uint8_t *dbname;
   uint8_t *journalname;
 };
+
+// Forwards
+static int insert(avl_key_t *key, avl_value_t *value, struct node **rp);
+static int remove_root(struct node **rp);
+static int remove_(avl_key_t *key, struct node **rp);
+static int truncate_transaction_file(struct avltree *avl);
 
 //
 // DISK
@@ -270,12 +265,6 @@ static int debug_dump_transactions(char *journalname) {
       case KVDBLITE_OP_REMOVE:
         printf("REMOVE: ");
         break;
-      case KVDBLITE_OP_DONE_INSERT:
-        printf("OLD INSERT: ");
-        break;
-      case KVDBLITE_OP_DONE_REMOVE:
-        printf("OLD REMOVE: ");
-        break;
       default:
         // All KVDBLITE_OP_ codes are characters for easy debug
         printf("UNKNOWN %c: ", op);
@@ -289,7 +278,7 @@ static int debug_dump_transactions(char *journalname) {
       return -1;
     printf("%s\n", v);
 
-    if ((op == KVDBLITE_OP_INSERT) || (op == KVDBLITE_OP_DONE_INSERT)){
+    if (op == KVDBLITE_OP_INSERT){
       // Value
       if (fread_uint32_t(&l, file) < 0)
         return -1;
@@ -304,15 +293,10 @@ static int debug_dump_transactions(char *journalname) {
   fclose(file);
 }
 
-// Return: Number of transactions applied
-// Not including skipped (old) transactions
-static int apply_next_transaction(struct avltree *avl) {
+static int apply_all_transactions(struct avltree *avl) {
   uint32_t l;
   uint8_t *v, *key, *value;
-  int skip = 0;
-  long last_entry_pos;
-  int count = 0;
-
+  
   FILE *file = fopen(avl->journalname, "r+b");
   if (!file) {
     return KVDBLITE_FAILED_TO_OPEN_DB_FILE;
@@ -321,66 +305,43 @@ static int apply_next_transaction(struct avltree *avl) {
   uint8_t op;
 
   while (1) {
-    skip = 0;
-    last_entry_pos = ftell(file);
     if (fread_uint8_t(&op, file) < 0) {
-      return -1;
+      return KVDBLITE_SUCCESS;
     }
-
-    if((op==KVDBLITE_OP_DONE_INSERT)||(op==KVDBLITE_OP_DONE_REMOVE))
-      skip = 1;
 
     // Key
     if (fread_uint32_t(&l, file) < 0)
-      return -1;
+      return KVDBLITE_UNEXPECTED_EOF;
     if (fread_str(&v, l, file) < 0)
-      return -1;
+      return KVDBLITE_UNEXPECTED_EOF;
     key = strdup(v);
     free(v);
 
-    if ((op == KVDBLITE_OP_INSERT) || (op == KVDBLITE_OP_DONE_INSERT)) {
+    if (op == KVDBLITE_OP_INSERT) {
       // Value
       if (fread_uint32_t(&l, file) < 0)
-        return -1;
+        return KVDBLITE_UNEXPECTED_EOF;
       if (fread_str(&v, l, file) < 0)
-        return -1;
+        return KVDBLITE_UNEXPECTED_EOF;
       value = strdup(v);
       free(v);
-      if(!skip) {
-        insert(key, value, &avl->root);
-
-        // TBD Mark transaction as DONE
-        // fseek(file, last_entry_pos, SEEK_SET);
-        // fwrite_uint8_t(KVDBLITE_OP_DONE_INSERT, file);
-        count++;
-      }
+      
+      insert(key, value, &avl->root);
 
       free(key);
       free(value);
-      if(skip)
-        continue;
-      else
-        break;
     } else {
-      if(!skip) {
-        remove_(key, &avl->root);
-        // fseek(file, last_entry_pos, SEEK_SET);
-        // fwrite_uint8_t(KVDBLITE_OP_DONE_REMOVE, file);
-        count++;
-      }
+      // KVDBLITE_OP_REMOVE
+      remove_(key, &avl->root);
 
       free(key);
-      if(skip)
-        continue;
-      else
-        break;
     }
   }
   // Need to be consistent, who closes the file?
   // And in the error case?
   fclose(file);
 
-  return count;
+  return KVDBLITE_SUCCESS;
 }
 
 //
@@ -451,8 +412,12 @@ static int insert(avl_key_t *key, avl_value_t *value, struct node **rp) {
   struct node *a = *rp;
   if (a == NULL)
     return insert_leaf(key, value, rp);
-  if (strcmp(key, a->key) == 0)
-    return 0;
+  if (strcmp(key, a->key) == 0) {
+    // Key already exists
+    free(a->value);
+    a->value = strdup(value);
+    return 0; // Tree structure didn't change
+  }
   if (strcmp(key, a->key) > 0)
     if (insert(key, value, &a->right) && (++a->diff) == 1)
       return 1;
@@ -567,12 +532,14 @@ static void zap_tree_traversal(struct avltree *avl) {
 }
 
 void avl_insert(struct avltree *avl, avl_key_t *key, avl_value_t *value) {
-  add_transaction(avl, KVDBLITE_OP_INSERT, key, value);
+  if(avl->journalname!=NULL)
+    add_transaction(avl, KVDBLITE_OP_INSERT, key, value);
   insert(key, value, &avl->root);
 }
 
 void avl_remove(struct avltree *avl, avl_key_t *key) {
-  add_transaction(avl, KVDBLITE_OP_REMOVE, key, NULL);
+  if(avl->journalname!=NULL)
+    add_transaction(avl, KVDBLITE_OP_REMOVE, key, NULL);
   remove_(key, &avl->root);
 }
 
@@ -593,14 +560,34 @@ struct node *avl_search(avl_key_t *key, struct node *root) {
   }
 }
 
-struct node *avl_lookup(struct avltree *avl, avl_key_t *key) {
-  return avl_search(key, avl->root);
+struct avl_lookup_result *avl_lookup(struct avltree *avl, avl_key_t *key) {
+  struct avl_lookup_result *r = NULL;
+  struct node *n = avl_search(key, avl->root);
+  if(n==NULL) {
+    return NULL;
+  } else {
+    r = malloc(sizeof *r);
+    if(r == NULL) {
+      return NULL;
+    }
+
+    r->key = strdup(n->key);
+    r->value = strdup(n->value);
+  }
+}
+
+void avl_free_lookup_result(struct avl_lookup_result *r) {
+  free(r->key);
+  free(r->value);
+  free(r);
 }
 
 void avl_free(struct avltree *avl) {
   free_(avl->root);
-  free(avl->dbname);
-  free(avl->journalname);
+  if(avl->dbname!=NULL)
+    free(avl->dbname);
+  if(avl->journalname!=NULL)
+    free(avl->journalname);
   free(avl);
 }
 
@@ -625,7 +612,8 @@ struct avltree *avl_make(uint8_t *fn) {
   }
 
   // Apply any transactions from the journal
-  // Gary you were here
+  apply_all_transactions(avl);
+
   return avl;
 }
 
@@ -662,6 +650,7 @@ static void inorder(struct node *root) {
   inorder(root->right);
 }
 
+// Too much recursion for large databases? Over 32K???
 static int inorder_count(struct node *root) {
   if (root == NULL) {
     return 0;
