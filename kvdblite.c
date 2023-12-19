@@ -1,3 +1,10 @@
+/*
+ * Copyright (C) 2023 Gary Sims
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,11 +18,11 @@
 
 // TODO
 // Increase performance of adding 100,000 entries. Seems creating journal file is slow.
-// CRC32 in saved db file
-// Only works with strings. Keys should be strings, but value should be binary with a len
 // Error handling needs to be robust and consistent
 // avl_import(char * fn) and avl_append(char *fn). The import needs to check that root is NULL.
-// Memory protection (for struct avltree), and mutex locking for all operations
+// Memory protection using mprotect() for struct avltree, 
+// Make thread safe (mutex locking etc)
+// Use network order when writing binary int32/uint32 etc, for cross platform compatibility
 
 struct node {
   struct node *left, *right;
@@ -35,7 +42,6 @@ static int insert(avl_key_t *key, avl_value_t *value, struct node **rp);
 static int remove_root(struct node **rp);
 static int remove_(avl_key_t *key, struct node **rp);
 static int truncate_transaction_file(struct avltree *avl);
-
 
 //
 // CRC32
@@ -82,45 +88,42 @@ uint32_t key_and_value_CRC32(avl_key_t *k, int klen, avl_value_t *v, int vlen) {
 //
 
 //
-// DISK
+// DISK IO
 //
 
 static int fwrite_str(uint8_t *s, FILE *file) {
   size_t itemsWritten = fwrite(s, strlen(s), 1, file);
-  //   if (itemsWritten != 1) {
-  //     perror("Failed to write to file");
-  //     fclose(file);
-  //     return 1;
-  // }
+  if (itemsWritten != 1) {
+    return -1;
+  }
   return 1;
 }
 static int fwrite_uint32_t(uint32_t value, FILE *file) {
-  // need to use network order for cross platform compatibility
+  // Need to use network order for cross platform compatibility
   size_t itemsWritten = fwrite(&value, sizeof(uint32_t), 1, file);
-  //   if (itemsWritten != 1) {
-  //     perror("Failed to write to file");
-  //     fclose(file);
-  //     return 1;
-  // }
+  if (itemsWritten != 1) {
+    return -11;
+  }
   return 1;
 }
 
 static int fwrite_uint8_t(uint8_t value, FILE *file) {
   size_t itemsWritten = fwrite(&value, sizeof(uint8_t), 1, file);
-  //   if (itemsWritten != 1) {
-  //     perror("Failed to write to file");
-  //     fclose(file);
-  //     return 1;
-  // }
+  if (itemsWritten != 1) {
+    return -11;
+  }
   return 1;
 }
 
 static int fread_str(uint8_t **v, uint32_t l, FILE *file) {
+  // TODO: Maybe sanity check the string length
+  if(l==0)
+    return -1;
   *v = malloc(l + 1);
   size_t itemsRead = fread(*v, l, 1, file);
   if (itemsRead != 1) {
-    //        perror("Failed to read from file");
-    fclose(file);
+    free(*v);
+    *v = NULL;
     return -1;
   }
   (*v)[l] = 0;
@@ -132,11 +135,8 @@ static int fread_uint32_t(uint32_t *value, FILE *file) {
   size_t itemsRead = fread(value, sizeof(uint32_t), 1, file);
 
   if (itemsRead != 1) {
-    //        perror("Failed to read from file");
-    fclose(file);
     return -1;
   }
-
   return 1;
 }
 
@@ -144,8 +144,6 @@ static int fread_uint8_t(uint8_t *value, FILE *file) {
   size_t itemsRead = fread(value, sizeof(uint8_t), 1, file);
 
   if (itemsRead != 1) {
-    //        perror("Failed to read from file");
-    fclose(file);
     return -1;
   }
 
@@ -153,17 +151,20 @@ static int fread_uint8_t(uint8_t *value, FILE *file) {
 }
 
 static void save_tree_to_disk(struct node *root, FILE *file) {
+  uint32_t l;
+
   // First save magic number
   uint32_t magic = 0x42473000;
   fwrite_uint32_t(magic, file);
 
   if (root == NULL) {
-    fwrite_uint32_t(0, file);
+    l = 0;
+    fwrite_uint32_t(l, file);
     return;
   }
 
   // Save current node's key and value
-  uint32_t l = strlen(root->key);
+  l = strlen(root->key);
   fwrite_uint32_t(l, file);
   fwrite_str(root->key, file);
 
@@ -199,25 +200,37 @@ int avl_save_database(struct avltree *avl) {
   save_tree_to_disk(avl->root, file);
 
   fclose(file);
-  // What happens if it crashes here, after fclose but before
-  // transaction file is truncated?
+  // If crash happens here, after fclose but before transaction file is truncated
+  // then at reload the transactions will be applied aghain, but they will be duplicates
+  // and have no affect on the final state of the database
   truncate_transaction_file(avl);
   return KVDBLITE_SUCCESS;
 }
 
 static struct node *load_tree_from_disk(FILE *file) {
-  char key[256], value[256];
+  //char key[256], value[256];
   uint32_t l, crc_calculated, crc_from_file;
   uint8_t *v;
-
-  // Gary you were here
-  // Need to load magic number
   
+  // Magic number (0x42473000)
   if (fread_uint32_t(&l, file) < 0)
     return NULL;
   if (l == 0)
     return NULL;
+  if (l!=0x42473000) {
+    // Bad magic number
+    return NULL;
+  }
 
+  // Read the key length
+  if (fread_uint32_t(&l, file) < 0)
+    return NULL;
+  if (l == 0) {
+    // A length of zero here also marks the end of a branch
+    return NULL;
+  }
+
+  // Read the key
   fread_str(&v, l, file);
 
   struct node *new_node = malloc(sizeof *new_node);
@@ -228,8 +241,10 @@ static struct node *load_tree_from_disk(FILE *file) {
   new_node->key = strdup(v);
   free(v);
 
+  // Read the value length
   if (fread_uint32_t(&l, file) < 0)
     return NULL;
+  // Read the value
   fread_str(&v, l, file);
   new_node->value = strdup(v);
   free(v);
@@ -318,6 +333,7 @@ static int debug_dump_transactions(char *journalname) {
 
   while (1) {
     if (fread_uint8_t(&op, file) < 0) {
+      fclose(file);
       return 1;
     }
 
@@ -334,25 +350,32 @@ static int debug_dump_transactions(char *journalname) {
     }
 
     // Key
-    if (fread_uint32_t(&l, file) < 0)
+    if (fread_uint32_t(&l, file) < 0) {
+      fclose(file);
       return -1;
+    }
     printf("Len: %d ", l);
-    if (fread_str(&v, l, file) < 0)
+    if (fread_str(&v, l, file) < 0) {
+      fclose(file);
       return -1;
+    }
     printf("%s\n", v);
 
     if (op == KVDBLITE_OP_INSERT){
       // Value
-      if (fread_uint32_t(&l, file) < 0)
+      if (fread_uint32_t(&l, file) < 0) {
+        fclose(file);
         return -1;
+      }
       printf("Len: %d ", l);
-      if (fread_str(&v, l, file) < 0)
+      if (fread_str(&v, l, file) < 0) {
+        fclose(file);
         return -1;
+      }
       printf("%s\n", v);
     }
   }
-  // Need to be consistent, who closes the file?
-  // And in the error case?
+
   fclose(file);
 }
 
@@ -369,23 +392,32 @@ static int apply_all_transactions(struct avltree *avl) {
 
   while (1) {
     if (fread_uint8_t(&op, file) < 0) {
+      fclose(file);
       return KVDBLITE_SUCCESS;
     }
 
     // Key
-    if (fread_uint32_t(&l, file) < 0)
+    if (fread_uint32_t(&l, file) < 0) {
+      fclose(file);
       return KVDBLITE_UNEXPECTED_EOF;
-    if (fread_str(&v, l, file) < 0)
+    }
+    if (fread_str(&v, l, file) < 0) {
+      fclose(file);
       return KVDBLITE_UNEXPECTED_EOF;
+    }
     key = strdup(v);
     free(v);
 
     if (op == KVDBLITE_OP_INSERT) {
       // Value
-      if (fread_uint32_t(&l, file) < 0)
+      if (fread_uint32_t(&l, file) < 0) {
+        fclose(file);
         return KVDBLITE_UNEXPECTED_EOF;
-      if (fread_str(&v, l, file) < 0)
+      }
+      if (fread_str(&v, l, file) < 0) {
+        fclose(file);
         return KVDBLITE_UNEXPECTED_EOF;
+      }
       value = strdup(v);
       free(v);
       
@@ -400,8 +432,6 @@ static int apply_all_transactions(struct avltree *avl) {
       free(key);
     }
   }
-  // Need to be consistent, who closes the file?
-  // And in the error case?
   fclose(file);
 
   return KVDBLITE_SUCCESS;
@@ -409,6 +439,10 @@ static int apply_all_transactions(struct avltree *avl) {
 
 //
 // End Journalling
+//
+
+//
+// AVL tree internals
 //
 
 static inline int max(int a, int b) { return a > b ? a : b; }
@@ -594,6 +628,63 @@ static void zap_tree_traversal(struct avltree *avl) {
   }
 }
 
+static int valid(struct node *a) {
+  int lh, rh, b;
+  if (a == NULL)
+    return 0;
+  lh = valid(a->left);
+  if(lh < 0)
+    return lh;
+  rh = valid(a->right);
+  if(rh < 0)
+    return rh;
+  b = rh - lh;
+
+  if (b != a->diff) {
+    printf("b %d, a->diff %d, rh %d, lh %d - a->key %s\n", b, a->diff, rh, lh,
+           a->key);
+    return KVDBLITE_INTERNAL_BALANCE_ERR;
+  }
+  if (abs(b) > 1)
+    return KVDBLITE_LOPSIDED_ERR;
+
+  return max(lh, rh) + 1;
+}
+
+// inorder traversal of the tree
+static void inorder(struct node *root) {
+  if (root == NULL) {
+    return;
+  }
+
+  inorder(root->left);
+  printf("%s: %s (%d)\n", root->key, root->value, root->diff);
+  inorder(root->right);
+}
+
+// Too much recursion for large databases? Over 32K???
+static int inorder_count(struct node *root) {
+  if (root == NULL) {
+    return 0;
+  }
+
+  int c = 0;
+
+  c = c + inorder_count(root->left);
+  c++;
+  c = c + inorder_count(root->right);
+
+  return c;
+}
+
+//
+// END AVL tree internals
+//
+
+//
+// AVL tree public API
+//
+
 void avl_insert(struct avltree *avl, avl_key_t *key, avl_value_t *value) {
   if(avl->journalname!=NULL)
     add_transaction(avl, KVDBLITE_OP_INSERT, key, value);
@@ -681,53 +772,7 @@ struct avltree *avl_make(uint8_t *fn) {
   return avl;
 }
 
-static int valid(struct node *a) {
-  int lh, rh, b;
-  if (a == NULL)
-    return 0;
-  lh = valid(a->left);
-  if(lh < 0)
-    return lh;
-  rh = valid(a->right);
-  if(rh < 0)
-    return rh;
-  b = rh - lh;
-
-  if (b != a->diff)
-    return KVDBLITE_INTERNAL_BALANCE_ERR;
-  if (abs(b) > 1)
-    return KVDBLITE_LOPSIDED_ERR;
-
-  return max(lh, rh) + 1;
-}
-
 int avl_check_valid(struct avltree *avl) { return valid(avl->root); }
-
-// inorder traversal of the tree
-static void inorder(struct node *root) {
-  if (root == NULL) {
-    return;
-  }
-
-  inorder(root->left);
-  printf("%s: %s (%d)\n", root->key, root->value, root->diff);
-  inorder(root->right);
-}
-
-// Too much recursion for large databases? Over 32K???
-static int inorder_count(struct node *root) {
-  if (root == NULL) {
-    return 0;
-  }
-
-  int c = 0;
-
-  c = c + inorder_count(root->left);
-  c++;
-  c = c + inorder_count(root->right);
-
-  return c;
-}
 
 int avl_db_size(struct avltree *avl) {
   struct node *root = avl->root;
@@ -757,3 +802,7 @@ void avl_debug_inorder(struct avltree *avl) {
   printf("Right:\n");
   inorder(root->right);
 }
+
+//
+// END AVL tree public API
+//
