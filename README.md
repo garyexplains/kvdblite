@@ -32,13 +32,13 @@ Run it a second time to load the DB from the disk rather than populate an empty 
 ## Writing data to disk
 There are several ways we could write the data to disk. More than I mention here. But here are some examples:
 
-### Write the whole database in a human-readable format like JSON
-- Good for debugging
-- Can be hand-edited
-- Good for copying data from one DB to another
-### Write the whole database in a binary format
-- Faster
-- Can include additional error-checking info inline (CRC etc)
+- Write the whole database in a human-readable format like JSON
+  - Good for debugging
+  - Can be hand-edited
+  - Good for copying data from one DB to another
+- Write the whole database in a binary format
+  - Faster
+  - Can include additional error-checking info inline (CRC etc)
 
 ### Performance
 But the problem with writing the whole database is that after every action on the tree, all the data needs to be written. If I add 1000 items to the database then 1000 times the whole database needs to be written to disk.
